@@ -1,6 +1,8 @@
 package apiserver
 
 import (
+	"time"
+
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	restclient "k8s.io/client-go/rest"
 	openapicontroller "k8s.io/kube-aggregator/pkg/controllers/openapi"
@@ -11,12 +13,18 @@ import (
 	"github.com/openshift/oauth-apiserver/pkg/cmd/oauth-apiserver/openapiconfig"
 	oauthapiserver "github.com/openshift/oauth-apiserver/pkg/oauth/apiserver"
 	"github.com/openshift/oauth-apiserver/pkg/serverscheme"
+	"github.com/openshift/oauth-apiserver/pkg/tokenvalidation"
 	userapiserver "github.com/openshift/oauth-apiserver/pkg/user/apiserver"
 	"github.com/openshift/oauth-apiserver/pkg/version"
 )
 
 type Config struct {
 	GenericConfig *genericapiserver.RecommendedConfig
+	ExtraConfig   OAuthAPIExtraConfig
+}
+
+type OAuthAPIExtraConfig struct {
+	AccessTokenInactivityTimeout time.Duration
 }
 
 type OAuthAPIServer struct {
@@ -26,6 +34,7 @@ type OAuthAPIServer struct {
 type completedConfig struct {
 	GenericConfig genericapiserver.CompletedConfig
 	ClientConfig  *restclient.Config
+	ExtraConfig   *OAuthAPIExtraConfig
 }
 
 // CompletedConfig embeds a private pointer that cannot be instantiated outside of this package.
@@ -44,6 +53,8 @@ func (cfg *Config) Complete() CompletedConfig {
 	c := completedConfig{
 		GenericConfig: cfg.GenericConfig.Complete(),
 		ClientConfig:  cfg.GenericConfig.ClientConfig,
+
+		ExtraConfig: &cfg.ExtraConfig,
 	}
 
 	v := version.Get()
@@ -56,6 +67,11 @@ func (cfg *Config) Complete() CompletedConfig {
 func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*OAuthAPIServer, error) {
 	delegateAPIServer := delegationTarget
 	var err error
+
+	delegateAPIServer, err = c.withTokenValidation(delegateAPIServer)
+	if err != nil {
+		return nil, err
+	}
 
 	delegateAPIServer, err = c.withOAuthAPIServer(delegateAPIServer)
 	if err != nil {
@@ -80,7 +96,11 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 
 func (c *completedConfig) withOAuthAPIServer(delegateAPIServer genericapiserver.DelegationTarget) (genericapiserver.DelegationTarget, error) {
 	cfg := &oauthapiserver.OAuthAPIServerConfig{
-		GenericConfig: &genericapiserver.RecommendedConfig{Config: *c.GenericConfig.Config, SharedInformerFactory: c.GenericConfig.SharedInformerFactory, ClientConfig: c.ClientConfig},
+		GenericConfig: &genericapiserver.RecommendedConfig{
+			Config:                *c.GenericConfig.Config,
+			SharedInformerFactory: c.GenericConfig.SharedInformerFactory,
+			ClientConfig:          c.ClientConfig,
+		},
 		ExtraConfig: oauthapiserver.ExtraConfig{
 			// no one is allowed to set this today
 			ServiceAccountMethod: string(openshiftcontrolplanev1.GrantHandlerPrompt),
@@ -97,8 +117,12 @@ func (c *completedConfig) withOAuthAPIServer(delegateAPIServer genericapiserver.
 
 func (c *completedConfig) withUserAPIServer(delegateAPIServer genericapiserver.DelegationTarget) (genericapiserver.DelegationTarget, error) {
 	cfg := &userapiserver.UserConfig{
-		GenericConfig: &genericapiserver.RecommendedConfig{Config: *c.GenericConfig.Config, SharedInformerFactory: c.GenericConfig.SharedInformerFactory, ClientConfig: c.ClientConfig},
-		ExtraConfig:   userapiserver.ExtraConfig{},
+		GenericConfig: &genericapiserver.RecommendedConfig{
+			Config:                *c.GenericConfig.Config,
+			SharedInformerFactory: c.GenericConfig.SharedInformerFactory,
+			ClientConfig:          c.ClientConfig,
+		},
+		ExtraConfig: userapiserver.ExtraConfig{},
 	}
 	config := cfg.Complete()
 	server, err := config.New(delegateAPIServer)
@@ -134,4 +158,26 @@ func (c *completedConfig) WithOpenAPIAggregationController(delegatedAPIServer *g
 		return nil
 	})
 	return nil
+}
+
+func (c *completedConfig) withTokenValidation(delegateAPIServer genericapiserver.DelegationTarget) (genericapiserver.DelegationTarget, error) {
+	cfg := &tokenvalidation.TokenValidationServerConfig{
+		GenericConfig: &genericapiserver.RecommendedConfig{
+			Config:                *c.GenericConfig.Config,
+			SharedInformerFactory: c.GenericConfig.SharedInformerFactory,
+			ClientConfig:          c.ClientConfig,
+		},
+		ExtraConfig: tokenvalidation.ExtraConfig{
+			AccessTokenInactivityTimeout: c.ExtraConfig.AccessTokenInactivityTimeout,
+		},
+	}
+
+	config := cfg.Complete()
+	server, err := config.New(delegateAPIServer)
+	if err != nil {
+		return nil, err
+	}
+
+	return server.GenericAPIServer, nil
+
 }
