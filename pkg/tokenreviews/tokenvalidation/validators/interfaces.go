@@ -1,4 +1,4 @@
-package oauth
+package validators
 
 import (
 	oauthv1 "github.com/openshift/api/oauth/v1"
@@ -28,14 +28,4 @@ func (v OAuthTokenValidators) Validate(token *oauthv1.OAuthAccessToken, user *us
 		}
 	}
 	return nil
-}
-
-type UserToGroupMapper interface {
-	GroupsFor(username string) ([]*userv1.Group, error)
-}
-
-type NoopGroupMapper struct{}
-
-func (n NoopGroupMapper) GroupsFor(username string) ([]*userv1.Group, error) {
-	return []*userv1.Group{}, nil
 }
