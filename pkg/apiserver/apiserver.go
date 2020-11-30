@@ -13,7 +13,6 @@ import (
 	"github.com/openshift/oauth-apiserver/pkg/cmd/oauth-apiserver/openapiconfig"
 	oauthapiserver "github.com/openshift/oauth-apiserver/pkg/oauth/apiserver"
 	"github.com/openshift/oauth-apiserver/pkg/serverscheme"
-	"github.com/openshift/oauth-apiserver/pkg/tokenvalidation"
 	userapiserver "github.com/openshift/oauth-apiserver/pkg/user/apiserver"
 	"github.com/openshift/oauth-apiserver/pkg/version"
 )
@@ -68,11 +67,6 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 	delegateAPIServer := delegationTarget
 	var err error
 
-	delegateAPIServer, err = c.withTokenValidation(delegateAPIServer)
-	if err != nil {
-		return nil, err
-	}
-
 	delegateAPIServer, err = c.withOAuthAPIServer(delegateAPIServer)
 	if err != nil {
 		return nil, err
@@ -104,6 +98,8 @@ func (c *completedConfig) withOAuthAPIServer(delegateAPIServer genericapiserver.
 		ExtraConfig: oauthapiserver.ExtraConfig{
 			// no one is allowed to set this today
 			ServiceAccountMethod: string(openshiftcontrolplanev1.GrantHandlerPrompt),
+
+			AccessTokenInactivityTimeout: c.ExtraConfig.AccessTokenInactivityTimeout,
 		},
 	}
 	config := cfg.Complete()
@@ -158,26 +154,4 @@ func (c *completedConfig) WithOpenAPIAggregationController(delegatedAPIServer *g
 		return nil
 	})
 	return nil
-}
-
-func (c *completedConfig) withTokenValidation(delegateAPIServer genericapiserver.DelegationTarget) (genericapiserver.DelegationTarget, error) {
-	cfg := &tokenvalidation.TokenValidationServerConfig{
-		GenericConfig: &genericapiserver.RecommendedConfig{
-			Config:                *c.GenericConfig.Config,
-			SharedInformerFactory: c.GenericConfig.SharedInformerFactory,
-			ClientConfig:          c.ClientConfig,
-		},
-		ExtraConfig: tokenvalidation.ExtraConfig{
-			AccessTokenInactivityTimeout: c.ExtraConfig.AccessTokenInactivityTimeout,
-		},
-	}
-
-	config := cfg.Complete()
-	server, err := config.New(delegateAPIServer)
-	if err != nil {
-		return nil, err
-	}
-
-	return server.GenericAPIServer, nil
-
 }

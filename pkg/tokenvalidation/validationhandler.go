@@ -4,18 +4,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
-	"github.com/emicklei/go-restful"
-
-	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authentication/user"
+	kuser "k8s.io/apiserver/pkg/authentication/user"
 
 	authorizationv1 "github.com/openshift/api/authorization/v1"
 	oauthv1 "github.com/openshift/api/oauth/v1"
@@ -35,6 +33,8 @@ const (
 )
 
 var errLookup = errors.New("token lookup failed")
+
+var _ authenticator.Request = &TokenValidationHandler{}
 
 type TokenValidationHandler struct {
 	accessTokenClient   oauthv1client.OAuthAccessTokenInterface
@@ -62,18 +62,20 @@ func NewTokenValidationHandler(
 	}
 }
 
-func (h *TokenValidationHandler) ServeHTTP(r *restful.Request, w *restful.Response) {
-	tokenReview := authenticationv1.TokenReview{}
-
-	if err := json.NewDecoder(r.Request.Body).Decode(&tokenReview); err != nil {
-		handleFailure(w, http.StatusBadRequest, fmt.Sprintf("the input data is not a token review request"))
-		return
+func (h *TokenValidationHandler) AuthenticateRequest(req *http.Request) (*authenticator.Response, bool, error) {
+	authorizationHeader := strings.TrimSpace(req.Header.Get("Authorization"))
+	if len(authorizationHeader) == 0 {
+		return nil, false, nil
 	}
 
-	tokenString := tokenReview.Spec.Token
+	authzHeaderSplit := strings.Split(authorizationHeader, " ")
+	if len(authzHeaderSplit) < 2 || strings.ToLower(authzHeaderSplit[0]) != "bearer" {
+		return nil, false, nil
+	}
+
+	tokenString := authzHeaderSplit[1]
 	if len(tokenString) == 0 {
-		handleFailure(w, http.StatusUnauthorized, "review request is missing a token")
-		return
+		return nil, false, nil
 	}
 
 	// normalize to sha256 form if sha256 token
@@ -84,14 +86,18 @@ func (h *TokenValidationHandler) ServeHTTP(r *restful.Request, w *restful.Respon
 
 	userInfo, err := h.gatherUserInfo(context.TODO(), tokenString)
 	if err != nil {
-		handleFailure(w, http.StatusUnauthorized, err.Error())
-		return
+		return nil, false, err
 	}
 
-	handleSucces(w, userInfo)
+	// we don't use audiences in the OpenShift access tokens, just copy them from the request to response
+	auds, _ := authenticator.AudiencesFrom(req.Context())
+	return &authenticator.Response{
+		User:      userInfo,
+		Audiences: auds,
+	}, true, nil
 }
 
-func (h *TokenValidationHandler) gatherUserInfo(ctx context.Context, tokenName string) (*authenticationv1.UserInfo, error) {
+func (h *TokenValidationHandler) gatherUserInfo(ctx context.Context, tokenName string) (user.Info, error) {
 	token, err := h.accessTokenClient.Get(ctx, tokenName, metav1.GetOptions{})
 	if err != nil {
 		return nil, errLookup // mask the error so we do not leak token data in logs
@@ -113,11 +119,11 @@ func (h *TokenValidationHandler) gatherUserInfo(ctx context.Context, tokenName s
 		return nil, fmt.Errorf("no such user")
 	}
 
-	return &authenticationv1.UserInfo{
-		Username: user.Name,
-		UID:      string(user.UID),
-		Groups:   groupNames,
-		Extra: map[string]authenticationv1.ExtraValue{
+	return &kuser.DefaultInfo{
+		Name:   user.Name,
+		UID:    string(user.UID),
+		Groups: groupNames,
+		Extra: map[string][]string{
 			authorizationv1.ScopesKey: token.Scopes,
 		},
 	}, nil
@@ -182,39 +188,4 @@ func (h *TokenValidationHandler) getOpenShiftUser(ctx context.Context, token *oa
 	// append system:authenticated:oauth group because if you have an OAuth
 	// bearer token, you're a human (usually)
 	return user, append(groupNames, authenticatedOAuthGroup), nil
-}
-
-func handleFailure(w *restful.Response, status int, errMsg string) {
-	failedReview := authenticationv1.TokenReview{
-		Status: authenticationv1.TokenReviewStatus{
-			Authenticated: false,
-			Error:         errMsg,
-		},
-	}
-	respBytes, err := runtime.Encode(encoder, &failedReview)
-	if err != nil {
-		w.WriteError(http.StatusInternalServerError, fmt.Errorf("failed to encode authentication failure: %v", err))
-		return
-	}
-
-	w.WriteHeader(status)
-	w.Write(respBytes)
-}
-
-func handleSucces(w *restful.Response, userInfo *authenticationv1.UserInfo) {
-	successReview := authenticationv1.TokenReview{
-		Status: authenticationv1.TokenReviewStatus{
-			Authenticated: true,
-			User:          *userInfo,
-		},
-	}
-
-	bytes, err := runtime.Encode(encoder, &successReview)
-	if err != nil {
-		handleFailure(w, http.StatusInternalServerError, "failed to encode authentication success")
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write(bytes)
 }
