@@ -2,28 +2,44 @@ package apiserver
 
 import (
 	"fmt"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 
 	oauthapiv1 "github.com/openshift/api/oauth/v1"
-	oauthclient "github.com/openshift/client-go/oauth/clientset/versioned/typed/oauth/v1"
+	oauthclients "github.com/openshift/client-go/oauth/clientset/versioned"
+	oauthinformer "github.com/openshift/client-go/oauth/informers/externalversions"
 	routeclient "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
+	userclient "github.com/openshift/client-go/user/clientset/versioned"
+	userinformer "github.com/openshift/client-go/user/informers/externalversions"
+	bootstrap "github.com/openshift/library-go/pkg/authentication/bootstrapauthenticator"
 	"github.com/openshift/library-go/pkg/oauth/oauthserviceaccountclient"
 
 	accesstokenetcd "github.com/openshift/oauth-apiserver/pkg/oauth/apiserver/registry/oauthaccesstoken/etcd"
 	authorizetokenetcd "github.com/openshift/oauth-apiserver/pkg/oauth/apiserver/registry/oauthauthorizetoken/etcd"
 	clientetcd "github.com/openshift/oauth-apiserver/pkg/oauth/apiserver/registry/oauthclient/etcd"
 	clientauthetcd "github.com/openshift/oauth-apiserver/pkg/oauth/apiserver/registry/oauthclientauthorization/etcd"
+	tokenreviews "github.com/openshift/oauth-apiserver/pkg/oauth/apiserver/registry/tokenreviews"
 	useroauthaccesstokensdelegate "github.com/openshift/oauth-apiserver/pkg/oauth/apiserver/registry/useroauthaccesstokens/delegate"
 	"github.com/openshift/oauth-apiserver/pkg/serverscheme"
+	"github.com/openshift/oauth-apiserver/pkg/tokenreviews/tokenvalidation"
+	"github.com/openshift/oauth-apiserver/pkg/tokenreviews/tokenvalidation/usercache"
+	tokenvalidators "github.com/openshift/oauth-apiserver/pkg/tokenreviews/tokenvalidation/validators"
+)
+
+const (
+	defaultInformerResyncPeriod     = 10 * time.Minute
+	minimumInactivityTimeoutSeconds = 300
 )
 
 type ExtraConfig struct {
-	ServiceAccountMethod string
+	ServiceAccountMethod         string
+	AccessTokenInactivityTimeout time.Duration
 }
 
 type OAuthAPIServerConfig struct {
@@ -68,7 +84,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		GenericAPIServer: genericServer,
 	}
 
-	v1Storage, err := c.newV1RESTStorage()
+	v1Storage, postStartHooks, err := c.newV1RESTStorage()
 	if err != nil {
 		return nil, err
 	}
@@ -79,13 +95,17 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		return nil, err
 	}
 
+	for hookname := range postStartHooks {
+		s.GenericAPIServer.AddPostStartHookOrDie(hookname, postStartHooks[hookname])
+	}
+
 	return s, nil
 }
 
-func (c *completedConfig) newV1RESTStorage() (map[string]rest.Storage, error) {
+func (c *completedConfig) newV1RESTStorage() (map[string]rest.Storage, map[string]genericapiserver.PostStartHookFunc, error) {
 	clientStorage, err := clientetcd.NewREST(c.GenericConfig.RESTOptionsGetter)
 	if err != nil {
-		return nil, fmt.Errorf("error building REST storage: %v", err)
+		return nil, nil, fmt.Errorf("error building REST storage: %v", err)
 	}
 
 	// If OAuth is disabled, set the strategy to Deny
@@ -95,17 +115,21 @@ func (c *completedConfig) newV1RESTStorage() (map[string]rest.Storage, error) {
 		saAccountGrantMethod = oauthapiv1.GrantHandlerType(c.ExtraConfig.ServiceAccountMethod)
 	}
 
-	oauthClient, err := oauthclient.NewForConfig(c.GenericConfig.LoopbackClientConfig)
+	oauthClient, err := oauthclients.NewForConfig(c.GenericConfig.LoopbackClientConfig)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	routeClient, err := routeclient.NewForConfig(c.kubeAPIServerClientConfig)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	coreV1Client, err := corev1.NewForConfig(c.kubeAPIServerClientConfig)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	userClient, err := userclient.NewForConfig(c.GenericConfig.LoopbackClientConfig)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	combinedOAuthClientGetter := oauthserviceaccountclient.NewServiceAccountOAuthClientGetter(
@@ -113,31 +137,84 @@ func (c *completedConfig) newV1RESTStorage() (map[string]rest.Storage, error) {
 		coreV1Client,
 		coreV1Client.Events(""),
 		routeClient,
-		oauthClient.OAuthClients(),
+		oauthClient.OauthV1().OAuthClients(),
 		saAccountGrantMethod,
 	)
 	authorizeTokenStorage, err := authorizetokenetcd.NewREST(c.GenericConfig.RESTOptionsGetter, combinedOAuthClientGetter)
 	if err != nil {
-		return nil, fmt.Errorf("error building REST storage: %v", err)
+		return nil, nil, fmt.Errorf("error building REST storage: %v", err)
 	}
 	accessTokenStorage, err := accesstokenetcd.NewREST(c.GenericConfig.RESTOptionsGetter, combinedOAuthClientGetter)
 	if err != nil {
-		return nil, fmt.Errorf("error building REST storage: %v", err)
+		return nil, nil, fmt.Errorf("error building REST storage: %v", err)
 	}
 	clientAuthorizationStorage, err := clientauthetcd.NewREST(c.GenericConfig.RESTOptionsGetter, combinedOAuthClientGetter)
 	if err != nil {
-		return nil, fmt.Errorf("error building REST storage: %v", err)
+		return nil, nil, fmt.Errorf("error building REST storage: %v", err)
 	}
 	userOAuthAccessTokensDelegate, err := useroauthaccesstokensdelegate.NewREST(accessTokenStorage)
 	if err != nil {
-		return nil, fmt.Errorf("error building REST storage: %v", err)
+		return nil, nil, fmt.Errorf("error building REST storage: %v", err)
+	}
+	tokenReviewStorage, tokenReviewPostStartHooks, err := c.tokenReviewStorage(coreV1Client, oauthClient, userClient)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error building REST storage: %v", err)
 	}
 
-	v1Storage := map[string]rest.Storage{}
-	v1Storage["oAuthAuthorizeTokens"] = authorizeTokenStorage
-	v1Storage["oAuthAccessTokens"] = accessTokenStorage
-	v1Storage["oAuthClients"] = clientStorage
-	v1Storage["oAuthClientAuthorizations"] = clientAuthorizationStorage
-	v1Storage["userOAuthAccessTokens"] = userOAuthAccessTokensDelegate
-	return v1Storage, nil
+	v1Storage := map[string]rest.Storage{
+		"oAuthAuthorizeTokens":      authorizeTokenStorage,
+		"oAuthAccessTokens":         accessTokenStorage,
+		"oAuthClients":              clientStorage,
+		"oAuthClientAuthorizations": clientAuthorizationStorage,
+		"userOAuthAccessTokens":     userOAuthAccessTokensDelegate,
+		"tokenReviews":              tokenReviewStorage,
+	}
+	return v1Storage, tokenReviewPostStartHooks, nil
+}
+
+func (c *completedConfig) tokenReviewStorage(
+	corev1Client corev1.CoreV1Interface,
+	oauthClient *oauthclients.Clientset,
+	userClient *userclient.Clientset,
+) (rest.Storage, map[string]genericapiserver.PostStartHookFunc, error) {
+	bootstrapUserDataGetter := bootstrap.NewBootstrapUserDataGetter(corev1Client, corev1Client)
+
+	// create informer for the users to be used in user <-> groups mapping
+	userInformer := userinformer.NewSharedInformerFactory(userClient, defaultInformerResyncPeriod)
+	if err := userInformer.User().V1().Groups().Informer().AddIndexers(cache.Indexers{
+		usercache.ByUserIndexName: usercache.ByUserIndexKeys,
+	}); err != nil {
+		return nil, nil, err
+	}
+
+	groupMapper := usercache.NewGroupCache(userInformer.User().V1().Groups())
+	oauthInformer := oauthinformer.NewSharedInformerFactory(oauthClient, defaultInformerResyncPeriod)
+
+	timeoutValidator := tokenvalidators.NewTimeoutValidator(
+		oauthClient.OauthV1().OAuthAccessTokens(),
+		oauthInformer.Oauth().V1().OAuthClients().Lister(),
+		c.ExtraConfig.AccessTokenInactivityTimeout,
+		minimumInactivityTimeoutSeconds)
+
+	postStartHooks := map[string]genericapiserver.PostStartHookFunc{}
+	postStartHooks["openshift.io-StartUserInformer"] = func(ctx genericapiserver.PostStartHookContext) error {
+		go userInformer.Start(ctx.StopCh)
+		return nil
+	}
+	postStartHooks["openshift.io-StartOAuthInformer"] = func(ctx genericapiserver.PostStartHookContext) error {
+		go oauthInformer.Start(ctx.StopCh)
+		return nil
+	}
+	postStartHooks["openshift.io-StartTokenTimeoutUpdater"] = func(ctx genericapiserver.PostStartHookContext) error {
+		go timeoutValidator.Run(ctx.StopCh)
+		return nil
+	}
+
+	tokenAuthenticator := tokenvalidation.NewTokenAuthenticator(
+		oauthClient.OauthV1().OAuthAccessTokens(), bootstrapUserDataGetter, userClient.UserV1().Users(), groupMapper,
+		tokenvalidators.NewExpirationValidator(), tokenvalidators.NewUIDValidator(), timeoutValidator)
+
+	tokenReviewWrapper, err := tokenreviews.NewREST(tokenAuthenticator)
+
+	return tokenReviewWrapper, postStartHooks, err
 }
